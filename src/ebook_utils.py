@@ -18,6 +18,7 @@ class EbookParser:
         self.books_dir = books_dir
         self.cache = {} 
         self.normalized_cache = {}
+        self.lower_cache = {}
         self.sentence_cache = {}
         # Stores metadata about where chapters begin/end in the full text
         self.spine_maps = {} 
@@ -168,7 +169,7 @@ class EbookParser:
             
             full_text, spine_map = self.extract_text_and_map(book_path)
             
-            if not full_text: return None, None
+            if not full_text: return None, None, None
 
             total_len = len(full_text)
             match_index = -1
@@ -230,12 +231,21 @@ class EbookParser:
                 # ~75 is roughly equivalent to allowing 20-25% errors.
                 cutoff_score = 75 
 
-                # partial_ratio_alignment finds the best alignment of the search_phrase 
+                # partial_ratio_alignment finds the best alignment of the search_phrase
                 # within the full_text.
                 # Returns an object with: score, src_start, src_end, dest_start, dest_end
+                #
+                # Compared lowercased: books set chat logs, system messages and
+                # emphasis in capitals that the transcript has in normal case
+                # (Dungeon Crawler Carl scored 70 on such a passage, 98+ either
+                # side of it). Same length, so dest_start indexes full_text.
+                cache_key = str(filename)
+                if cache_key not in self.lower_cache:
+                    lowered = full_text.lower()
+                    self.lower_cache[cache_key] = lowered if len(lowered) == total_len else full_text
                 alignment = rapidfuzz.fuzz.partial_ratio_alignment(
-                    search_phrase, 
-                    full_text, 
+                    search_phrase.lower(),
+                    self.lower_cache[cache_key],
                     score_cutoff=cutoff_score
                 )
 

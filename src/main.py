@@ -298,9 +298,11 @@ class SyncManager:
                 source = "ABS"
 
             updated_ok = False
-            # Set when a position was matched but the server rejected the write.
-            # State is then left untouched so the next cycle retries the push.
-            write_failed = False
+            # Set when this change could not be synced: no text at the position,
+            # no match on the other side, or the server rejected the write. State
+            # is then left untouched so the next cycle tries again. Recording it
+            # as synced would drop the position for good unless it moved again.
+            retry_reason = None
             try:
                 if source == "ABS":
                     target_text = self.transcriber.get_text_at_time(transcript_path, abs_progress)
@@ -322,9 +324,12 @@ class SyncManager:
                                 prev_state['kosync_index'] = index_delta
                                 updated_ok = True
                             else:
-                                write_failed = True
+                                retry_reason = "KoSync write failed"
                         else:
                             logger.error("  ❌ Ebook text match FAILED.")
+                            retry_reason = "Ebook text match failed"
+                    else:
+                        retry_reason = "No transcript text at this time"
                 else:
                     target_text = self.ebook_parser.get_text_at_percentage(ebook_filename, kosync_progress)
                     if target_text:
@@ -337,24 +342,20 @@ class SyncManager:
                                 prev_state['kosync_pct'] = kosync_progress
                                 updated_ok = True
                             else:
-                                write_failed = True
+                                retry_reason = "ABS write failed"
                         else:
-                             logger.error("  ❌ Transcript text match FAILED.")
+                            logger.error("  ❌ Transcript text match FAILED.")
+                            retry_reason = "Transcript text match failed"
+                    else:
+                        retry_reason = "No ebook text at this position"
 
                 if updated_ok:
                     prev_state['last_updated'] = time.time()
                     self.state[abs_id] = prev_state
                     self._save_state()
                     logger.info("  💾 State saved.")
-                elif write_failed:
-                    logger.warning("  ⏭️  Write failed, state not saved. Will retry next cycle.")
                 else:
-                    prev_state['abs_ts'] = abs_progress
-                    prev_state['kosync_pct'] = kosync_progress
-                    prev_state['last_updated'] = time.time()
-                    self.state[abs_id] = prev_state
-                    self._save_state()
-                    logger.info("  🤷 State matched to avoid loop.")
+                    logger.warning(f"  ⏭️  {retry_reason}, state not saved. Will retry next cycle.")
             except Exception as e:
                 logger.error(f"   Error syncing {abs_title}: {e}")
 
