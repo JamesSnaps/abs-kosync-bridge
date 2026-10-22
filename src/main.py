@@ -298,6 +298,9 @@ class SyncManager:
                 source = "ABS"
 
             updated_ok = False
+            # Set when a position was matched but the server rejected the write.
+            # State is then left untouched so the next cycle retries the push.
+            write_failed = False
             try:
                 if source == "ABS":
                     target_text = self.transcriber.get_text_at_time(transcript_path, abs_progress)
@@ -313,11 +316,13 @@ class SyncManager:
                             #index_delta = abs(matched_index - prev_state.get('kosync_index', 0))
                             logger.info(f"  🪲 Index delta of {index_delta}.")
                             
-                            self.kosync_client.update_progress(kosync_id, matched_pct, xpath)
-                            prev_state['abs_ts'] = abs_progress
-                            prev_state['kosync_pct'] = matched_pct
-                            prev_state['kosync_index'] = index_delta
-                            updated_ok = True
+                            if self.kosync_client.update_progress(kosync_id, matched_pct, xpath):
+                                prev_state['abs_ts'] = abs_progress
+                                prev_state['kosync_pct'] = matched_pct
+                                prev_state['kosync_index'] = index_delta
+                                updated_ok = True
+                            else:
+                                write_failed = True
                         else:
                             logger.error("  ❌ Ebook text match FAILED.")
                 else:
@@ -327,10 +332,12 @@ class SyncManager:
                         matched_time = self.transcriber.find_time_for_text(transcript_path, target_text)
                         if matched_time is not None:
                             logger.info(f"  ✅ Match at {matched_time:.2f}s. Sending Update...")
-                            self.abs_client.update_progress(abs_id, matched_time)
-                            prev_state['abs_ts'] = matched_time
-                            prev_state['kosync_pct'] = kosync_progress
-                            updated_ok = True
+                            if self.abs_client.update_progress(abs_id, matched_time):
+                                prev_state['abs_ts'] = matched_time
+                                prev_state['kosync_pct'] = kosync_progress
+                                updated_ok = True
+                            else:
+                                write_failed = True
                         else:
                              logger.error("  ❌ Transcript text match FAILED.")
 
@@ -339,6 +346,8 @@ class SyncManager:
                     self.state[abs_id] = prev_state
                     self._save_state()
                     logger.info("  💾 State saved.")
+                elif write_failed:
+                    logger.warning("  ⏭️  Write failed, state not saved. Will retry next cycle.")
                 else:
                     prev_state['abs_ts'] = abs_progress
                     prev_state['kosync_pct'] = kosync_progress

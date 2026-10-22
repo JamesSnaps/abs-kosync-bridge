@@ -135,12 +135,17 @@ class ABSClient:
         if 'isFinished' in existing:
             payload['isFinished'] = existing['isFinished']
 
+        # Returns whether the write landed. The caller must not record the new
+        # position as synced unless it did.
         try:
             r = requests.patch(url, headers=self.headers, json=payload, timeout=15)
             if r.status_code not in (200, 201):
                 logger.error(f"  ABS update failed: {r.status_code} - {r.text}")
+                return False
+            return True
         except Exception as e:
             logger.error(f"  Failed to update ABS progress: {e}")
+            return False
 
 class KoSyncClient:
     def __init__(self):
@@ -198,14 +203,45 @@ class KoSyncClient:
             "timestamp": int(time.time())
         }
         
-        try:
-            # Reverted to simple PUT logic
-            r = requests.put(url, headers=headers, json=payload)
-            
-            if r.status_code not in [200, 201]:
-                logger.error(f"  KoSync Update Failed: {r.status_code} - {r.text}")
-            else:
+        # Returns whether the write landed. A rejected write that is recorded as
+        # synced leaves the server holding the old position, and the next cycle
+        # reads that back as a reading change and moves the audiobook to it.
+        #
+        # The sync cycle reads every mapped book in a burst just before this
+        # write, which can exhaust the server's rate limit (korrosync defaults
+        # to a burst of 5), so a 429 is retried after the advertised wait.
+        for attempt in range(1, KOSYNC_WRITE_ATTEMPTS + 1):
+            try:
+                r = requests.put(url, headers=headers, json=payload, timeout=15)
+            except Exception as e:
+                logger.error(f"  Failed to update KoSync: {e}")
+                return False
+
+            if r.status_code in (200, 201):
                 logger.info(f"  KoSync updated successfully (HTTP {r.status_code})")
-                
-        except Exception as e:
-            logger.error(f"Failed to update KoSync: {e}")
+                return True
+
+            if r.status_code == 429 and attempt < KOSYNC_WRITE_ATTEMPTS:
+                wait = _retry_after_seconds(r)
+                logger.warning(f"  KoSync rate limited, retrying in {wait:.0f}s ({attempt}/{KOSYNC_WRITE_ATTEMPTS})")
+                time.sleep(wait)
+                continue
+
+            logger.error(f"  KoSync Update Failed: {r.status_code} - {r.text}")
+            return False
+        return False
+
+
+KOSYNC_WRITE_ATTEMPTS = 4
+
+
+def _retry_after_seconds(response, default=2.0, cap=10.0):
+    # tower_governor (korrosync) sends Retry-After / x-ratelimit-after in seconds.
+    for header in ("retry-after", "x-ratelimit-after"):
+        value = response.headers.get(header)
+        if value:
+            try:
+                return min(max(float(value), 1.0), cap)
+            except ValueError:
+                pass
+    return default
