@@ -19,7 +19,11 @@ class AudioTranscriber:
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
         self.cache_root = data_dir / "audio_cache"
         self.cache_root.mkdir(parents=True, exist_ok=True)
-        self.model_size = "tiny" 
+        # Was hardcoded to "tiny". Transcript quality is the whole product here,
+        # so make it configurable and default to something usable.
+        self.model_size = os.getenv("WHISPER_MODEL", "small.en")
+        self.cpu_threads = int(os.getenv("WHISPER_THREADS", 4))
+        logger.info(f"Transcriber model: {self.model_size} ({self.cpu_threads} threads)")
 
     def _get_audio_duration(self, filepath):
         try:
@@ -162,7 +166,7 @@ class AudioTranscriber:
             logger.info(f"🧠 Phase 2: Transcribing using {self.model_size} model...")
             
             # Optimization: cpu_threads set explicitly, compute_type int8
-            model = WhisperModel(self.model_size, device="cpu", compute_type="int8", cpu_threads=4)
+            model = WhisperModel(self.model_size, device="cpu", compute_type="int8", cpu_threads=self.cpu_threads)
             full_transcript = []
             cumulative_duration = 0.0
 

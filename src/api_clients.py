@@ -88,24 +88,43 @@ class ABSClient:
             return []
 
     def get_progress(self, item_id):
+        # A fetch FAILURE must not look like "position zero" -- the caller would
+        # treat that as a huge backwards jump and rewind the ebook to page one.
+        # A 404 genuinely means "no progress recorded yet" and is safe as 0.0.
         url = f"{self.base_url}/api/me/progress/{item_id}"
-        try:
-            r = requests.get(url, headers=self.headers)
-            if r.status_code == 200:
-                return r.json().get('currentTime', 0)
-        except Exception:
-            pass
-        return 0.0
+        r = requests.get(url, headers=self.headers, timeout=15)
+        if r.status_code == 404:
+            return 0.0
+        r.raise_for_status()
+        return float(r.json().get('currentTime', 0) or 0)
 
     def update_progress(self, item_id, timestamp):
+        # Read-modify-write. Blindly sending duration=0/isFinished=False wipes
+        # the real duration and un-finishes completed books.
         url = f"{self.base_url}/api/me/progress/{item_id}"
-        payload = {
-            "currentTime": timestamp,
-            "duration": 0, 
-            "isFinished": False
-        }
+
+        existing = {}
         try:
-            requests.patch(url, headers=self.headers, json=payload)
+            r = requests.get(url, headers=self.headers, timeout=15)
+            if r.status_code == 200:
+                existing = r.json()
+        except Exception as e:
+            logger.warning(f"  Could not read existing ABS progress, sending minimal update: {e}")
+
+        payload = {"currentTime": timestamp}
+
+        duration = existing.get('duration') or 0
+        if duration > 0:
+            payload['duration'] = duration
+            payload['progress'] = min(max(timestamp / duration, 0.0), 1.0)
+
+        if 'isFinished' in existing:
+            payload['isFinished'] = existing['isFinished']
+
+        try:
+            r = requests.patch(url, headers=self.headers, json=payload, timeout=15)
+            if r.status_code not in (200, 201):
+                logger.error(f"  ABS update failed: {r.status_code} - {r.text}")
         except Exception as e:
             logger.error(f"  Failed to update ABS progress: {e}")
 
@@ -136,16 +155,18 @@ class KoSyncClient:
             return False
 
     def get_progress(self, doc_id):
+        # As with ABS: only a genuine "nothing recorded" answer may return 0.0.
+        # Network errors and auth failures must raise so the sync cycle skips
+        # this book rather than rewinding it to the start.
         headers = {"x-auth-user": self.user, "x-auth-key": self.auth_token, 'accept': 'application/vnd.koreader.v1+json'}
         url = f"{self.base_url}/syncs/progress/{doc_id}"
-        try:
-            r = requests.get(url, headers=headers)
-            if r.status_code == 200:
-                data = r.json()
-                return float(data.get('percentage', 0))
-        except Exception:
-            pass
-        return 0.0
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 404:
+            return 0.0
+        r.raise_for_status()
+        data = r.json() or {}
+        # A synced-but-unread document can come back with an empty body.
+        return float(data.get('percentage', 0) or 0)
 
     def update_progress(self, doc_id, percentage, xpath=None):
         headers = {"x-auth-user": self.user, "x-auth-key": self.auth_token, 'accept': 'application/vnd.koreader.v1+json', 'content-type': 'application/json'}
