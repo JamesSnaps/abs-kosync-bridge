@@ -1,7 +1,8 @@
 
 # Using Python 3.11 Slim (Debian) instead of Alpine
 # Alpine + PyTorch/NumPy (required for Whisper) is extremely unstable on ARM
-FROM python:3.11-slim-bookworm
+# Patch version pinned alongside requirements.txt.
+FROM python:3.11.17-slim-bookworm
 
 WORKDIR /app
 
