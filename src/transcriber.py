@@ -1,16 +1,33 @@
+import bisect
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import gc
 from pathlib import Path
 from faster_whisper import WhisperModel
+from rapidfuzz import fuzz
 import requests
 import ffmpeg
 import math
 
 logger = logging.getLogger(__name__)
+
+_QUOTES = str.maketrans({"‘": "'", "’": "'", "“": '"',
+                         "”": '"', "–": "-", "—": "-"})
+
+
+def _normalise_for_match(text):
+    """Lowercase, straighten smart quotes, collapse whitespace.
+
+    The EPUB uses typographic punctuation; Whisper emits plain ASCII. Both
+    sides must be normalised identically or the offsets will not line up.
+    """
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text.translate(_QUOTES).lower()).strip()
 
 class AudioTranscriber:
     def __init__(self, data_dir):
@@ -23,6 +40,7 @@ class AudioTranscriber:
         # so make it configurable and default to something usable.
         self.model_size = os.getenv("WHISPER_MODEL", "small.en")
         self.cpu_threads = int(os.getenv("WHISPER_THREADS", 4))
+        self._index_cache = {}
         logger.info(f"Transcriber model: {self.model_size} ({self.cpu_threads} threads)")
 
     def _get_audio_duration(self, filepath):
@@ -256,19 +274,67 @@ class AudioTranscriber:
         
         return None
 
+    def _transcript_index(self, transcript_path):
+        """Whole transcript as one normalised string, plus a char-offset -> time map.
+
+        Cached per file; rebuilding this for every sync cycle on a 17-hour book
+        is thousands of segments of needless work.
+        """
+        key = str(transcript_path)
+        mtime = os.path.getmtime(transcript_path)
+        cached = self._index_cache.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+
+        with open(transcript_path, 'r') as f:
+            data = json.load(f)
+
+        parts, offsets, starts, pos = [], [], [], 0
+        for seg in data:
+            text = _normalise_for_match(seg.get('text', ''))
+            if not text:
+                continue
+            offsets.append(pos)
+            starts.append(seg['start'])
+            parts.append(text)
+            pos += len(text) + 1
+
+        index = (" ".join(parts), offsets, starts)
+        self._index_cache[key] = (mtime, index)
+        return index
+
     def find_time_for_text(self, transcript_path, search_text):
-        from rapidfuzz import process, fuzz
+        """Locate ebook text in the transcript and return its audio timestamp.
+
+        Searches the transcript as a single continuous string. The previous
+        implementation scored a ~900 character query against individual short
+        segments with partial_ratio -- which aligns the shorter string inside
+        the longer, so almost every segment scored above the threshold and the
+        winner was effectively arbitrary. That is why an 83%-of-the-ebook
+        position resolved to 29% of the audio.
+        """
         try:
-            with open(transcript_path, 'r') as f:
-                data = json.load(f)
-            
-            texts = [d['text'] for d in data]
-            match = process.extractOne(search_text, texts, scorer=fuzz.partial_ratio)
-            
-            if match and match[1] > 80:
-                index = match[2]
-                return data[index]['start']
+            joined, offsets, starts = self._transcript_index(transcript_path)
+            if not joined:
+                return None
+
+            query = _normalise_for_match(search_text)
+            if len(query) < 60:
+                logger.warning("  Query too short to match reliably; skipping.")
+                return None
+
+            alignment = fuzz.partial_ratio_alignment(query, joined, score_cutoff=70)
+            if not alignment:
+                logger.info("  No transcript match above cutoff.")
+                return None
+
+            idx = bisect.bisect_right(offsets, alignment.dest_start) - 1
+            idx = max(0, min(idx, len(starts) - 1))
+            logger.info(f"  Transcript match score {alignment.score:.1f} "
+                        f"at {starts[idx]:.1f}s")
+            return starts[idx]
+
         except Exception as e:
             logger.error(f"Error searching transcript {transcript_path}: {e}")
-        
+
         return None

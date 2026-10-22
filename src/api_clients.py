@@ -114,6 +114,20 @@ class ABSClient:
         payload = {"currentTime": timestamp}
 
         duration = existing.get('duration') or 0
+        if duration <= 0:
+            # An existing record can carry duration=0 (earlier versions of this
+            # client wrote that unconditionally). Without a duration we cannot
+            # send `progress`, and ABS then shows a stale percentage that
+            # disagrees with its own remaining-time figure. Fall back to the
+            # item's real duration.
+            try:
+                item = requests.get(f"{self.base_url}/api/items/{item_id}",
+                                    headers=self.headers, timeout=15)
+                if item.status_code == 200:
+                    duration = item.json().get('media', {}).get('duration') or 0
+            except Exception as e:
+                logger.warning(f"  Could not read item duration: {e}")
+
         if duration > 0:
             payload['duration'] = duration
             payload['progress'] = min(max(timestamp / duration, 0.0), 1.0)
