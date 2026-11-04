@@ -173,7 +173,8 @@ class KoSyncClient:
             logger.error(f"❌ KoSync Error: {e}")
             return False
 
-    def get_progress(self, doc_id):
+    def get_position(self, doc_id):
+        """Returns (percentage, xpointer). The xpointer is None if none is recorded."""
         # As with ABS: only a genuine "nothing recorded" answer may return 0.0.
         # Network errors and auth failures must raise so the sync cycle skips
         # this book rather than rewinding it to the start.
@@ -181,11 +182,11 @@ class KoSyncClient:
         url = f"{self.base_url}/syncs/progress/{doc_id}"
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code == 404:
-            return 0.0
+            return 0.0, None
         r.raise_for_status()
         data = r.json() or {}
         # A synced-but-unread document can come back with an empty body.
-        return float(data.get('percentage', 0) or 0)
+        return float(data.get('percentage', 0) or 0), data.get('progress') or None
 
     def update_progress(self, doc_id, percentage, xpath=None):
         headers = {"x-auth-user": self.user, "x-auth-key": self.auth_token, 'accept': 'application/vnd.koreader.v1+json', 'content-type': 'application/json'}

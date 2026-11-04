@@ -236,7 +236,7 @@ class SyncManager:
 
             try:
                 abs_progress = self.abs_client.get_progress(abs_id)
-                kosync_progress = self.kosync_client.get_progress(kosync_id)
+                kosync_progress, kosync_xpointer = self.kosync_client.get_position(kosync_id)
             except Exception as e:
                 logger.error(f"Fetch failed for {abs_title}: {e}")
                 continue
@@ -331,7 +331,7 @@ class SyncManager:
                     else:
                         retry_reason = "No transcript text at this time"
                 else:
-                    target_text = self.ebook_parser.get_text_at_percentage(ebook_filename, kosync_progress)
+                    target_text = self.ebook_parser.get_text_at_position(ebook_filename, kosync_xpointer, kosync_progress)
                     if target_text:
                         logger.info(f"   🔍 Searching Transcript for text: '{target_text[:60]}...'")
                         matched_time = self.transcriber.find_time_for_text(transcript_path, target_text)
