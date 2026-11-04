@@ -31,8 +31,9 @@ class EbookParser:
         self.lower_cache = {}
         self.sentence_cache = {}
         # Stores metadata about where chapters begin/end in the full text
-        self.spine_maps = {} 
-        
+        self.spine_maps = {}
+        self.book_paths = {}
+
         self.fuzzy_threshold = int(os.getenv("FUZZY_MATCH_THRESHOLD", 80))
         self.hash_method = os.getenv("KOSYNC_HASH_METHOD", "content").lower()
         logger.info(f"Initialized EbookParser. ID Method: {self.hash_method}")
@@ -42,11 +43,18 @@ class EbookParser:
         Robustly finds a file in the books directory, handling special characters
         like [ ] (brackets) which break standard glob patterns.
         """
+        # Every sync cycle resolves every mapped book, and searching the whole
+        # library on the NAS is too slow to repeat that often.
+        known = self.book_paths.get(filename)
+        if known and known.exists():
+            return known
+
         # 1. Try Glob with escaping (Fastest)
         try:
             # Escape brackets, etc.
-            safe_name = glob.escape(filename) 
-            return next(self.books_dir.glob(f"**/{safe_name}"))
+            safe_name = glob.escape(filename)
+            self.book_paths[filename] = next(self.books_dir.glob(f"**/{safe_name}"))
+            return self.book_paths[filename]
         except StopIteration:
             pass
             
@@ -54,6 +62,7 @@ class EbookParser:
         # This catches edge cases where glob.escape might behave differently on OS versions
         for f in self.books_dir.rglob("*"):
             if f.name == filename:
+                self.book_paths[filename] = f
                 return f
         
         raise FileNotFoundError(f"Could not locate {filename}")
@@ -371,24 +380,18 @@ class EbookParser:
             logger.error(f"  Error extracting text from {filename}: {e}")
             return None
 
-    def get_character_delta(self, filename, percentage_prev, percentage_new):
+    def get_position_index(self, filename, xpointer, percentage):
+        """Character offset of a reading position, or None if the book can't be read."""
         try:
             book_path = self._resolve_book_path(filename)
-        
-            full_text, _ = self.extract_text_and_map(book_path)
-            
+            full_text, spine_map = self.extract_text_and_map(book_path)
             if not full_text: return None
-            
-            total_len = len(full_text)
-            index_prev = int(total_len * percentage_prev)
-            index_new = int(total_len * percentage_new)
 
-            character_delta = abs(index_new - index_prev)
-                        
-            return character_delta
+            index = self._xpointer_to_index(spine_map, xpointer) if xpointer else None
+            return int(len(full_text) * percentage) if index is None else index
         except FileNotFoundError:
             logger.error(f"  Book file not found: {filename}")
             return None
         except Exception as e:
-            logger.error(f"  Error calculating character delta for {filename}: {e}")
+            logger.error(f"  Error reading position in {filename}: {e}")
             return None

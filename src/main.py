@@ -57,13 +57,11 @@ class SyncManager:
         # Load Sync Thresholds
         # ABS: Seconds (Default 60s)
         self.delta_abs_thresh = float(os.getenv("SYNC_DELTA_ABS_SECONDS", 60))
-        # KoSync: Percentage (Default 1%) -> Converted to 0.01
-        self.delta_kosync_thresh = float(os.getenv("SYNC_DELTA_KOSYNC_PERCENT", 1)) / 100.0
         # Kosync: Character (Default 400 Words) -> Converted to characters by multiplying by 5
         self.delta_kosync_char_thresh = float(os.getenv("SYNC_DELTA_KOSYNC_WORDS", 400)) * 5
-        
-        
-        logger.info(f"⚙️  Sync Thresholds: ABS={self.delta_abs_thresh}s, KoSync={self.delta_kosync_thresh:.2%} ({self.delta_kosync_char_thresh} chars)")
+
+
+        logger.info(f"⚙️  Sync Thresholds: ABS={self.delta_abs_thresh}s, KoSync={self.delta_kosync_char_thresh} chars")
         
         self.startup_checks()
         self.cleanup_stale_jobs()
@@ -241,56 +239,45 @@ class SyncManager:
                 logger.error(f"Fetch failed for {abs_title}: {e}")
                 continue
 
-            prev_state = self.state.get(abs_id, {"abs_ts": 0, "kosync_pct": 0, "last_updated": 0, "kosync_index": 0})
+            kosync_char = self.ebook_parser.get_position_index(ebook_filename, kosync_xpointer, kosync_progress)
+            if kosync_char is None:
+                logger.error(f"Could not read a position in {ebook_filename}; skipping {abs_title}")
+                continue
 
             ## Define and set defaults if empty.
-            defaults = {"abs_ts": 0, "kosync_pct": 0, "last_updated": 0, "kosync_index": 0}
+            defaults = {"abs_ts": 0, "kosync_pct": 0, "last_updated": 0, "kosync_char": 0}
             existing_data = self.state.get(abs_id, {})
             prev_state = defaults | existing_data
-                
-            abs_delta = abs(abs_progress - prev_state['abs_ts'])
-            kosync_delta = abs(kosync_progress - prev_state['kosync_pct'])
-            
-            # --- THRESHOLD LOGIC ---
-            abs_changed = abs_delta > self.delta_abs_thresh
-            kosync_changed = kosync_delta > self.delta_kosync_thresh
 
-            # Log ignored changes for debugging
-            if abs_delta > 0 and not abs_changed:
-                logger.info(f"  ✋ ABS delta {abs_delta:.2f}s (Below threshold {self.delta_abs_thresh}s): {abs_title}")
-                prev_state['abs_ts'] = abs_progress   
-                prev_state['last_updated'] = time.time()
-                ## change me
-                prev_state['kosync_index'] = 0
+            # State saved before kosync_char existed has nothing to compare with.
+            # Start from here rather than treat the whole position as a move.
+            if existing_data and 'kosync_char' not in existing_data:
+                prev_state['kosync_char'] = kosync_char
                 self.state[abs_id] = prev_state
                 self._save_state()
-                logger.info("  🤷 State matched to avoid loop.")
-            if kosync_delta > 0 and not kosync_changed:
-                logger.info(f"  ✋ KoSync delta {kosync_delta:.4%} (Below threshold {self.delta_kosync_thresh:.2%}): {ebook_filename}")
-                # logger.info(f"  🪲 Attempting to resolve character delta")
-                
-                index_delta = self.ebook_parser.get_character_delta(ebook_filename, prev_state['kosync_pct'], kosync_progress)
-                # logger.info(f"  🪲 KoSync character delta {index_delta}")
 
-                ## Hardcoded for testing! Adjust for new env variable.
-                if index_delta > self.delta_kosync_char_thresh:
-                    kosync_changed = True
-                    logger.info(f"  🪲 KoSync character delta more than threshhold {index_delta}/{self.delta_kosync_char_thresh}")
-                else:  
-                    logger.info(f"  🪲 KoSync character delta less than threshhold {index_delta}/{self.delta_kosync_char_thresh}")
-                    prev_state['kosync_pct'] = kosync_progress
-                    prev_state['last_updated'] = time.time()
-                    ## change me
-                    prev_state['kosync_index'] = 0
-                    self.state[abs_id] = prev_state
-                    self._save_state()
-                    logger.info("  🤷 State matched to avoid loop.")
+            abs_delta = abs(abs_progress - prev_state['abs_ts'])
+            # Measured in characters from the exact position. KOReader's percentage
+            # follows its page layout, so it differs from the percentage written
+            # back by this bridge even when the reader hasn't moved.
+            kosync_delta = abs(kosync_char - prev_state['kosync_char'])
+
+            # --- THRESHOLD LOGIC ---
+            # A move below the threshold leaves state alone, so small moves add up
+            # until they cross it instead of being lost one at a time.
+            abs_changed = abs_delta > self.delta_abs_thresh
+            kosync_changed = kosync_delta > self.delta_kosync_char_thresh
+
+            if abs_delta > 0 and not abs_changed:
+                logger.debug(f"  ✋ ABS delta {abs_delta:.2f}s (Below threshold {self.delta_abs_thresh}s): {abs_title}")
+            if kosync_delta > 0 and not kosync_changed:
+                logger.debug(f"  ✋ KoSync delta {kosync_delta} chars (Below threshold {self.delta_kosync_char_thresh}): {ebook_filename}")
 
             if not abs_changed and not kosync_changed: continue
 
             logger.info(f"Change detected for '{abs_title}'")
             logger.info(f"  📊 ABS: {prev_state['abs_ts']:.2f}s -> {abs_progress:.2f}s")
-            logger.info(f"  📊 KoSync: {prev_state['kosync_pct']:.4f}% -> {kosync_progress:.4f}%")
+            logger.info(f"  📊 KoSync: {prev_state['kosync_pct']:.2%} -> {kosync_progress:.2%} ({kosync_delta} chars)")
             
             source = "ABS" if abs_changed else "KOSYNC"
             if abs_changed and kosync_changed:
@@ -313,15 +300,15 @@ class SyncManager:
                         if matched_pct is not None:
                             logger.info(f"  ✅ Match at {matched_pct:.2%}. Sending Update...")
 
-                            ## DEBUG. WIP function, to measure change in position based on characters not %
-                            index_delta = abs(matched_index - prev_state['kosync_index'])
-                            #index_delta = abs(matched_index - prev_state.get('kosync_index', 0))
-                            logger.info(f"  🪲 Index delta of {index_delta}.")
-                            
                             if self.kosync_client.update_progress(kosync_id, matched_pct, xpath):
                                 prev_state['abs_ts'] = abs_progress
                                 prev_state['kosync_pct'] = matched_pct
-                                prev_state['kosync_index'] = index_delta
+                                # Where the next cycle will read this write back from. The
+                                # xpath only points at an element, which can start well
+                                # before the matched text; a baseline of matched_index
+                                # would read that gap as the reader moving.
+                                written_char = self.ebook_parser.get_position_index(ebook_filename, xpath, matched_pct)
+                                prev_state['kosync_char'] = matched_index if written_char is None else written_char
                                 updated_ok = True
                             else:
                                 retry_reason = "KoSync write failed"
@@ -340,6 +327,7 @@ class SyncManager:
                             if self.abs_client.update_progress(abs_id, matched_time):
                                 prev_state['abs_ts'] = matched_time
                                 prev_state['kosync_pct'] = kosync_progress
+                                prev_state['kosync_char'] = kosync_char
                                 updated_ok = True
                             else:
                                 retry_reason = "ABS write failed"
