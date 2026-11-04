@@ -13,6 +13,16 @@ from fuzzysearch import find_near_matches
 
 logger = logging.getLogger(__name__)
 
+XPOINTER_RE = re.compile(
+    r'^/body/DocFragment\[(?P<fragment>\d+)\]/body'
+    r'(?P<path>(?:/[\w:-]+(?:\[\d+\])?)*)'
+    r'(?P<text>/text\(\)(?:\[(?P<text_position>\d+)\])?)?'
+    r'(?:\.(?P<offset>\d+))?$'
+)
+XPOINTER_STEP_RE = re.compile(r'/([\w:-]+)(?:\[(\d+)\])?')
+XPOINTER_MARK = ''
+POSITION_TEXT_LENGTH = 900
+
 class EbookParser:
     def __init__(self, books_dir):
         self.books_dir = books_dir
@@ -292,6 +302,68 @@ class EbookParser:
             end = min(total_len, target_index + 450)
             
             return full_text[start:end]
+        except FileNotFoundError:
+            logger.error(f"  Book file not found: {filename}")
+            return None
+        except Exception as e:
+            logger.error(f"  Error extracting text from {filename}: {e}")
+            return None
+
+    def _xpointer_to_index(self, spine_map, xpointer):
+        """Offset of a KOReader xpointer in the text from extract_text_and_map, or None.
+
+        Handles what KOReader sends (.../p[50]/text().655) and the element-only
+        paths _generate_xpath writes back (.../p[75]/b[1]).
+        """
+        match = XPOINTER_RE.match(xpointer)
+        if not match:
+            return None
+
+        item = next((s for s in spine_map if s['spine_index'] == int(match['fragment'])), None)
+        if item is None:
+            return None
+
+        soup = BeautifulSoup(item['content'], 'html.parser')
+        try:
+            node = soup.find('body')
+            for name, position in XPOINTER_STEP_RE.findall(match['path']):
+                node = node.find_all(name, recursive=False)[int(position or 1) - 1]
+
+            # Mark the spot and search for it, so the offset is measured in exactly
+            # the text extract_text_and_map produces.
+            if match['text']:
+                texts = [c for c in node.children if type(c) is NavigableString and c.strip()]
+                text = texts[int(match['text_position'] or 1) - 1]
+                offset = int(match['offset'] or 0)
+                text.replace_with(text[:offset] + XPOINTER_MARK + text[offset:])
+            else:
+                node.insert(0, XPOINTER_MARK)
+        except (AttributeError, IndexError):
+            return None
+
+        local_index = soup.get_text(separator=' ', strip=True).find(XPOINTER_MARK)
+        return item['start'] + local_index if local_index >= 0 else None
+
+    def get_text_at_position(self, filename, xpointer, percentage):
+        """Ebook text beginning at the reader's position, to look up in the transcript.
+
+        KOReader's percentage follows its page layout, not the book's characters,
+        so taking that fraction of the text can land several pages away. The
+        xpointer is exact. The transcript match is timed from the start of this
+        text, so it starts at the position instead of being centred on it.
+        """
+        try:
+            book_path = self._resolve_book_path(filename)
+            full_text, spine_map = self.extract_text_and_map(book_path)
+            if not full_text: return None
+
+            index = self._xpointer_to_index(spine_map, xpointer) if xpointer else None
+            if index is None:
+                logger.warning(f"  Could not resolve position '{xpointer}'; using {percentage:.2%} instead.")
+                return self.get_text_at_percentage(filename, percentage)
+
+            start = max(0, min(index, len(full_text) - POSITION_TEXT_LENGTH))
+            return full_text[start:start + POSITION_TEXT_LENGTH]
         except FileNotFoundError:
             logger.error(f"  Book file not found: {filename}")
             return None
